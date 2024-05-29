@@ -78,6 +78,8 @@ struct segment {
     int64_t duration;
     int64_t url_offset;
     int64_t size;
+    uint8_t discontinuity;
+    uint8_t discontinuity_handled;
     char *url;
     char *key;
     enum KeyType key_type;
@@ -753,6 +755,7 @@ static int parse_playlist(HLSContext *c, const char *url,
     struct segment **prev_segments = NULL;
     int prev_n_segments = 0;
     int64_t prev_start_seq_no = -1;
+    int discontinuity_marker = 0;
 
     if (is_http && !in && c->http_persistent && c->playlist_pb) {
         in = c->playlist_pb;
@@ -927,6 +930,11 @@ static int parse_playlist(HLSContext *c, const char *url,
             ptr = strchr(ptr, '@');
             if (ptr)
                 seg_offset = strtoll(ptr+1, NULL, 10);
+        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY-SEQUENCE", &ptr)) {
+            av_log(c->ctx, AV_LOG_INFO, "Skip ('%s')\n", line);
+            continue;
+        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY", &ptr)) {
+            discontinuity_marker = 1;
         } else if (av_strstart(line, "#", NULL)) {
             av_log(c->ctx, AV_LOG_INFO, "Skip ('%s')\n", line);
             continue;
@@ -1010,6 +1018,9 @@ static int parse_playlist(HLSContext *c, const char *url,
                 }
 
                 seg->init_section = cur_init_section;
+                seg->discontinuity = discontinuity_marker;
+                seg->discontinuity_handled = 0;
+                discontinuity_marker = 0;
             }
         }
     }
@@ -1553,8 +1564,15 @@ reload:
         v->input_read_done = 0;
         seg = current_segment(v);
 
+
+
+        if (seg->discontinuity && !seg->discontinuity_handled) {
+            return AVERROR_EOF;
+        }
+
         /* load/update Media Initialization Section, if any */
         ret = update_init_section(v, seg);
+
         if (ret)
             return ret;
 
@@ -1566,6 +1584,7 @@ reload:
         } else {
             ret = open_input(c, v, seg, &v->input);
         }
+
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback))
                 return AVERROR_EXIT;
@@ -2307,6 +2326,50 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                 AVRational tb;
                 struct segment *seg = NULL;
                 ret = av_read_frame(pls->ctx, pls->pkt);
+                if (ret == AVERROR_EOF
+                && pls->cur_seq_no < pls->start_seq_no + pls->n_segments
+                && pls->segments[pls->cur_seq_no - pls->start_seq_no]->discontinuity) {
+                    // Reinit subdemuxer now that we have a discontinuity
+                    av_log(s, AV_LOG_DEBUG, "Hls discontinuity\n");
+
+                    AVDictionary *options = NULL;
+                    AVFormatContext *new_ctx = avformat_alloc_context();
+                    AVInputFormat *in_fmt = pls->ctx->iformat;
+                    char* url;
+                    seg = current_segment(pls);
+                    new_ctx->io_open = pls->ctx->io_open;
+                    new_ctx->flags = pls->ctx->flags;
+                    avformat_close_input(&pls->ctx);
+                    pls->ctx = new_ctx;
+
+                    pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
+                    if (!pls->read_buffer){
+                        avformat_free_context(pls->ctx);
+                        pls->ctx = NULL;
+                        return AVERROR(ENOMEM);
+                    }
+
+                    ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                                      read_data, NULL, NULL);
+                    new_ctx->pb = &pls->pb.pub;
+
+                    if ((ret = ff_copy_whiteblacklists(new_ctx, pls->parent)) < 0)
+                        return ret;
+
+                    av_dict_copy(&options, c->seg_format_opts, 0);
+                    // TODO: Check why this has to be exactly here
+                    // TODO: Also check when this needs to be reset. On seek probably?
+                    seg->discontinuity_handled = 1;
+                    ret = avformat_open_input(&new_ctx, seg->url, in_fmt, &options);
+                    av_dict_free(&options);
+                    if (ret < 0) {
+                        av_log(pls->parent, AV_LOG_WARNING, "Failed to open playlist %d\n",
+                               pls->index);
+                        return ret;
+                    }
+                    ret = av_read_frame(pls->ctx, pls->pkt);
+
+                }
                 if (ret < 0) {
                     if (!avio_feof(&pls->pb.pub) && ret != AVERROR_EOF)
                         return ret;
