@@ -80,6 +80,7 @@ struct segment {
     int64_t size;
     uint8_t discontinuity;
     uint8_t discontinuity_handled;
+    int64_t discontinuity_sequence;
     char *url;
     char *key;
     enum KeyType key_type;
@@ -175,6 +176,8 @@ struct playlist {
      * playlist, if any. */
     int n_init_sections;
     struct segment **init_sections;
+
+    int64_t discontinuity_sequence;
 };
 
 /*
@@ -756,6 +759,7 @@ static int parse_playlist(HLSContext *c, const char *url,
     int prev_n_segments = 0;
     int64_t prev_start_seq_no = -1;
     int discontinuity_marker = 0;
+    int current_discontinuity_sequence = 0;
 
     if (is_http && !in && c->http_persistent && c->playlist_pb) {
         in = c->playlist_pb;
@@ -807,6 +811,7 @@ static int parse_playlist(HLSContext *c, const char *url,
 
         pls->finished = 0;
         pls->type = PLS_TYPE_UNSPECIFIED;
+        pls->discontinuity_sequence = 0;
     }
     while (!avio_feof(in)) {
         ff_get_chomp_line(in, line, sizeof(line));
@@ -930,10 +935,15 @@ static int parse_playlist(HLSContext *c, const char *url,
             ptr = strchr(ptr, '@');
             if (ptr)
                 seg_offset = strtoll(ptr+1, NULL, 10);
-        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY-SEQUENCE", &ptr)) {
-            av_log(c->ctx, AV_LOG_INFO, "Skip ('%s')\n", line);
+        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY-SEQUENCE:", &ptr)) {
+            ret = ensure_playlist(c, &pls, url);
+            if (ret < 0)
+                goto fail;
+            current_discontinuity_sequence = seg_size = strtoll(ptr, NULL, 10);
+            pls->discontinuity_sequence = current_discontinuity_sequence;
             continue;
         } else if (av_strstart(line, "#EXT-X-DISCONTINUITY", &ptr)) {
+            current_discontinuity_sequence++;
             discontinuity_marker = 1;
         } else if (av_strstart(line, "#", NULL)) {
             av_log(c->ctx, AV_LOG_INFO, "Skip ('%s')\n", line);
@@ -1020,6 +1030,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 seg->init_section = cur_init_section;
                 seg->discontinuity = discontinuity_marker;
                 seg->discontinuity_handled = 0;
+                seg->discontinuity_sequence = current_discontinuity_sequence;
                 discontinuity_marker = 0;
             }
         }
@@ -2330,7 +2341,7 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                 && pls->cur_seq_no < pls->start_seq_no + pls->n_segments
                 && pls->segments[pls->cur_seq_no - pls->start_seq_no]->discontinuity) {
                     // Reinit subdemuxer now that we have a discontinuity
-                    av_log(s, AV_LOG_DEBUG, "Hls discontinuity\n");
+                    av_log(s, AV_LOG_INFO, "Hls discontinuity, reseting sub-demuxer\n");
 
                     AVDictionary *options = NULL;
                     AVFormatContext *new_ctx = avformat_alloc_context();
@@ -2428,9 +2439,12 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
             } else {
                 int64_t dts     =    pls->pkt->dts;
                 int64_t mindts  = minpls->pkt->dts;
+                int64_t discontinuity_sequence = current_segment(pls)->discontinuity_sequence;
+                int64_t min_discontinuity_sequence = current_segment(minpls)->discontinuity_sequence;
 
                 if (dts == AV_NOPTS_VALUE ||
-                    (mindts != AV_NOPTS_VALUE && compare_ts_with_wrapdetect(dts, pls, mindts, minpls) < 0))
+                        discontinuity_sequence < min_discontinuity_sequence ||
+                                (discontinuity_sequence == min_discontinuity_sequence && mindts != AV_NOPTS_VALUE && compare_ts_with_wrapdetect(dts, pls, mindts, minpls) < 0))
                     minplaylist = i;
             }
         }
