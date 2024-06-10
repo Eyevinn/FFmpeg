@@ -178,6 +178,8 @@ struct playlist {
     struct segment **init_sections;
 
     int64_t discontinuity_sequence;
+    /* Indicate that current discontinuity sequence has been read completely */
+    int8_t discontinuity_sequence_eof;
 };
 
 /*
@@ -812,6 +814,7 @@ static int parse_playlist(HLSContext *c, const char *url,
         pls->finished = 0;
         pls->type = PLS_TYPE_UNSPECIFIED;
         pls->discontinuity_sequence = 0;
+        pls->discontinuity_sequence_eof = 0;
     }
     while (!avio_feof(in)) {
         ff_get_chomp_line(in, line, sizeof(line));
@@ -939,7 +942,7 @@ static int parse_playlist(HLSContext *c, const char *url,
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
                 goto fail;
-            current_discontinuity_sequence = seg_size = strtoll(ptr, NULL, 10);
+            current_discontinuity_sequence = strtoll(ptr, NULL, 10);
             pls->discontinuity_sequence = current_discontinuity_sequence;
             continue;
         } else if (av_strstart(line, "#EXT-X-DISCONTINUITY", &ptr)) {
@@ -1509,6 +1512,11 @@ restart:
     if (!v->needed)
         return AVERROR_EOF;
 
+    // Needed because mov_read_default calls avio_feof after EOF
+    // and this logic breaks with our handling of discontinuity
+    if (v->discontinuity_sequence_eof)
+        return AVERROR_EOF;
+
     if (!v->input || (c->http_persistent && v->input_read_done)) {
         int64_t reload_interval;
 
@@ -1578,6 +1586,7 @@ reload:
 
 
         if (seg->discontinuity && !seg->discontinuity_handled) {
+            v->discontinuity_sequence_eof = 1;
             return AVERROR_EOF;
         }
 
@@ -1628,7 +1637,7 @@ reload:
 
     seg = next_segment(v);
     if (c->http_multiple == 1 && !v->input_next_requested &&
-        seg && seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL)) {
+        seg && seg->key_type == KEY_NONE && !seg->discontinuity && av_strstart(seg->url, "http", NULL)) {
         ret = open_input(c, v, seg, &v->input_next);
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback))
@@ -2371,6 +2380,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     // TODO: Check why this has to be exactly here
                     // TODO: Also check when this needs to be reset. On seek probably?
                     seg->discontinuity_handled = 1;
+                    pls->discontinuity_sequence_eof = 0;
+                    pls->input_read_done = 1; // Makes sure we read first segment after discontinuity
                     ret = avformat_open_input(&new_ctx, seg->url, in_fmt, &options);
                     av_dict_free(&options);
                     if (ret < 0) {
